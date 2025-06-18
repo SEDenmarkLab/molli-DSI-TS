@@ -1,0 +1,1247 @@
+from __future__ import annotations
+from .geometry import CartesianGeometry, rotation_matrix, find_centroid, sub_rotate_around_line, sub_rotation_matrix, distance, angle_between_normals, fit_plane, deg_rad_conv
+from typing import List, Dict, Union, Set, Any, Callable, overload
+import os
+import json
+
+
+from copy import deepcopy
+import numpy as np
+from ..ftypes import parse_xyz
+from xml.dom import minidom as xmd
+from xml.etree.cElementTree import parse as xparse
+from io import IOBase
+from itertools import chain ## ksp
+import pandas as pd ## ksp
+from scipy.spatial.transform import Rotation
+import inspect
+
+
+def yield_mol2_block_lines(title, text):
+    """
+    Yield lines delimited by @TRIPOS<some_name> [...]
+    """
+
+    lines = [x.strip() for x in str(text).splitlines()]
+    # print(title)
+
+    s = lines.index("@<TRIPOS>{}".format(str(title).strip().upper()))
+
+    for l in lines[s + 1 :]:
+        if l and l[0] == "@":
+            break
+        else:
+            yield l
+
+
+def get_mol2_block_lines(title: str, text: str) -> list:
+    return list(yield_mol2_block_lines(title, text))
+
+
+class Atom:
+    """
+    Symbol, label, atom type.
+
+    ! Additional treatment of stereogenicity.
+
+    """
+
+    def __init__(
+        self,
+        symbol: str,
+        label: str,
+        atom_type: str = "C",
+        stereo: str = "U",
+        ap: bool = False,
+        frag_label: int = 0, 
+    ):
+
+        self.label = str(label)
+        self.symbol = str(symbol)
+        self.atom_type = str(atom_type)
+        self.stereo = stereo  # Maybe use in the future?
+        self.ap = ap  # Maybe use in the future?
+        self.frag_label = frag_label 
+
+        # Capture creation location # this is temporary
+        frame = inspect.currentframe()
+        caller_frame = frame.f_back
+        self.creation_info = inspect.getframeinfo(caller_frame)
+
+        
+        
+    def __str__(self):
+        return f"{self.label}"
+
+    def __repr__(self):
+        return f"{self.label}"
+
+    def set_attachment_point(self, v: bool = True):
+        self.ap = v
+        
+    def swap(self, newlabel: str= "H"):
+        self.label = newlabel
+        self.symbol = newlabel
+        self.atom_type = newlabel
+
+class Bond:
+    """
+    Chemical bond
+    """
+
+    def __init__(self, a1: Atom, a2: Atom, bond_type: str = None, label: int = 1):
+        self.label = label
+        self.a1 = a1
+        self.a2 = a2
+        self.bond_type = bond_type
+
+    def __contains__(self, a: Atom):
+        if self.a1 == a or self.a2 == a:
+            return True
+        else:
+            return False
+
+
+
+    def __repr__(self):
+        return f"Bond ({self.bond_type}) {self.a1}-{self.a2}"
+
+    def __return_other__(self, a: Atom):
+        """
+        Get the other atom from a bond (if it is present) to query what something is attached to.
+        """
+        assert self.__contains__(a) == True
+        if self.a1 == a:
+            return self.a2
+        else:
+            return self.a1
+
+
+class Fragment:
+    """
+    This class is not defined yet
+    """
+
+    ...
+
+
+class Property:
+    """
+    Any property that can be attributable to a whole molecule / atom / bond / conformer
+    """
+
+    def __init__(self, ref, ptype: str, value: str, source: str = ""):
+        self.ref = ref
+        # check reference object for type
+        if not isinstance(ref, (Atom, Bond, Fragment, CartesianGeometry, Molecule)):
+            raise NotImplementedError(
+                "Reference must be an object in (Atom, Bond, Fragment, CartesianGeometry, Molecule)"
+            )
+
+        self.ptype = ptype
+        self.value = value
+        self.source = source
+
+
+def structure_clone(atoms: List[Atom], bonds: List[Bond]) -> (List[Atom], List[Bond]):
+    """
+    This functions allows deep copying of atoms and bonds, keeping the connectivity table intact
+    Bonds are not kept if their atoms are not in the list!
+    """
+    old_new_map = {}
+    new_atoms = []
+    new_bonds = []
+
+    for a in atoms:
+        _a = deepcopy(a)
+        #_a = a
+        old_new_map[a] = _a
+        new_atoms.append(_a)
+
+    for b in bonds:
+        if b.a1 in old_new_map and b.a2 in old_new_map:
+            _a1 = old_new_map[b.a1]
+            _a2 = old_new_map[b.a2]
+
+            new_bonds.append(Bond(_a1, _a2, b.bond_type))
+            #new_bonds.append(b)
+            
+    return new_atoms, new_bonds, old_new_map
+
+class Molecule:
+    """
+    Molecule is a class that is supposed to be a cornerstone in all cross-talk between different pieces of code.
+    XML-serializable.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        atoms: List[Atom],
+        bonds: List[Bond],
+        geom: CartesianGeometry,
+        conformers: List[CartesianGeometry] = [],
+        clone: bool = True,
+        conformer_energies = [], #this should contain a list of the associated conformer energies
+        conformed_conformers = [], # an array of conformer geometries that are compatible with update_geom_from_xyz().. Can write a function, but this is good enough...
+        important_atoms = [],
+        fragment_atoms = [], # list of atoms from base structure + atoms that were added!
+        xtb_energy: int = -1,
+        xtb_conf_energies: float = -1.0,
+    ):
+        """"""
+        self.name = name
+        self.atoms, self.bonds = atoms, bonds
+        self.geom = geom
+        self.conformers = conformers
+        self.important_atoms = important_atoms
+        self.fragment_atoms = fragment_atoms
+        self.conformed_conformers = conformed_conformers
+        self.xtb_energy = xtb_energy
+        self.xtb_conf_energies = xtb_conf_energies
+
+
+    def __contains__(self, x):
+        if isinstance(x, Atom):
+            return x in self.atoms
+        if isinstance(x, Bond):
+            return x in self.bonds
+
+    @classmethod
+    def from_mol2(cls, mol2s: str | IOBase, name: str = None):
+        """
+        Parse a mol2 string and generate a Molecule object
+        """
+
+        if isinstance(mol2s, str) and os.path.isfile(mol2s):
+            with open(mol2s) as f:
+                mol2block = f.read()
+        elif hasattr(mol2s, "read"):
+            mol2block = mol2s.read()
+        elif isinstance(mol2s, str):
+            mol2block = mol2s
+        else:
+            raise NotImplementedError
+
+        if isinstance(mol2block, bytes):
+            mol2block = mol2block.decode()
+
+        ## Retrieving molecule metadata
+        mol2_header = get_mol2_block_lines("MOLECULE", mol2block)
+        _name = mol2_header[0] if name == None else name
+
+        ## Generating the list of atoms and molecular geometry
+        mol2_atoms = get_mol2_block_lines("ATOM", mol2block)
+
+        _atoms = []
+        _geom = []
+        for line in mol2_atoms:
+            ls = line.split()
+            sym = ls[5].rsplit(".")[0]
+            _atoms.append(Atom(sym, ls[1], ls[5]))
+            _geom.append(list(map(float, ls[2:5])))
+
+        ## Generating the list of bonds
+        mol2_bonds = get_mol2_block_lines("BOND", mol2block)
+        _bonds = []
+
+        for line in mol2_bonds:
+            ls = line.split()
+            if (
+                len(ls) == 0
+            ):  # Writing can add an extra line - this is FROM molli-written files.
+                continue
+            a1, a2, bt = int(ls[1]) - 1, int(ls[2]) - 1, ls[3]
+            _bonds.append(Bond(_atoms[a1], _atoms[a2], bond_type=bt))
+
+        return cls(
+            name=_name, atoms=_atoms, bonds=_bonds, geom=CartesianGeometry(_geom)
+        )
+
+    def has_confomers(self):
+        """"""
+        return True if self.conformers else False
+
+    def get_atom(self, label: Atom | str):
+        """
+        Returns the first atom with matching label
+        """
+
+        return self.atoms[self.get_atom_idx(label)]
+
+    def get_atoms_by_symbol(self, symbol: str):
+        """
+        Returns all atoms with matching symbol
+        """
+        atoms = []
+        for a in self.atoms:
+            if a.symbol == symbol:
+                atoms.append(a)
+
+        return atoms
+
+
+    def get_atoms_by_label(self, labels: list):
+        
+        atoms = []
+        for input_atom in labels:
+            for a in self.atoms:
+                if a.label == input_atom:
+                    atoms.append(a)
+        return atoms
+    
+    def get_atoms_from_bond(self, bonds: list[Bond]):
+        atoms = []
+        for b in bonds:
+            atoms.append(b.a1)
+            atoms.append(b.a2)
+        return list(dict.fromkeys(atoms)) #only return unique items
+
+
+    def recursive_atoms(self, atoms: list, n: int = 3):
+        n = n-1
+        if(isinstance(atoms,Atom)): #if the starting point is an atom ...
+            _tmpatoms = [atoms]
+        if(isinstance(atoms,list)):
+            if(isinstance(atoms[0],Atom)):
+                _tmpatoms = atoms
+            if(isinstance(atoms[0],str)):
+
+                _tmpatoms = self.get_atoms_by_label(atoms)
+
+        bonds = []
+
+        for item in _tmpatoms:
+            for bond in self.get_bonds_with_atom(item):
+                if self.get_bond_length(bond)<3:
+                    bonds.append(self.get_bonds_with_atom(item))
+
+        bonds = list(chain(*bonds))
+        
+        if (n>0):
+            atoms, bonds = self.recursive_atoms(self.get_atoms_from_bond(bonds), n)
+            
+        return list(set(atoms)), list(set(bonds))
+
+  
+      
+    def get_atom_idx(self, label: Atom | str):
+        if isinstance(label, Atom):
+            return self.atoms.index(label) #get the index# of the particular label...
+
+        for a in self.atoms:
+            if a.label == label:
+                return self.atoms.index(a)
+
+        raise IndexError(f"Cannot find {label} in {self.name}")
+
+    def add_bond(self, a1: Atom, a2: Atom, bond_type: str = "1"):
+        """
+        Create an additional bond
+        """
+        self.bonds.append(Bond(a1, a2, bond_type=bond_type))
+
+    def add_attachment_atom(
+        self, a1: Atom, a2: Atom, v: np.array, length: float, bond_type=1
+    ):
+        """
+        a1 = atom already in molecule
+        a2 = new atom to add (with labels set, etc)
+        v = direction for new bond to form
+        length = desired length of bond
+        Add an attachment atom to a specific atom in a molecule with a specified direction for the new bond.
+        """
+        # Get x,y,z for attachment point, then add scaled directional vector to get coords for new atom
+        a2_coord = self.geom.get_coord(self.atoms.index(a1)) + (length * v)
+        assert len(a2_coord) == 3
+
+        a2.set_attachment_point()  # In case they forget
+        self.atoms.append(a2)
+        self.geom.coord = np.append(self.geom.coord, [a2_coord], axis=0)
+        self.add_bond(a1, a2, bond_type=bond_type)
+        self.geom.N += 1  # Have to increment this OR serialization/reading to/from experimental xml format fails
+
+
+    def get_bonds_with_atom(self, a: Atom):
+        res = []
+        for b in self.bonds:
+            if a in b:
+                res.append(b)
+        return res
+
+    def get_atom_valence(self, a: Atom):
+        """
+        Return sum of bond orders that exist with a given atom
+        """
+        assert a in self.atoms
+        a_bonds = self.get_bonds_with_atom(a)
+
+        orders = []
+
+        for b in a_bonds:
+            try:
+                o = int(b.bond_type)
+            except:
+                if b.bond_type == "ar":
+                    orders.append(1)
+            else:
+                orders.append(o)
+
+        valence = sum(orders)
+        return valence
+
+    def get_connected_atoms(self, a: Atom | str) -> Set[Atom]:
+        """
+        Return a `set` of atoms connected to a given atom
+        """
+        atoms = set()
+        for b in self.get_bonds_with_atom(a):
+            atoms.add(b.a1 if b.a2 == a else b.a2)
+
+        return atoms
+
+    def get_subgeom(self, atoms: List[Atom], conformer=-1):
+        """
+        Return a subset of atomic position
+        if conformer = -1: return default geometry
+        if integer >= 0: return subgeometry of conformer with that index
+        """
+        subgeom = []
+        if conformer == -1:
+            for a in atoms:
+                c = self.geom.get_coord(self.get_atom_idx(a))
+                subgeom.append(c)
+        else:
+            for a in atoms:
+                c = self.conformers[conformer].get_coord(self.get_atom_idx(a))
+                subgeom.append(c)
+
+        return CartesianGeometry(subgeom)
+
+    def update_geom_from_xyz(self, xyzblock: str, assert_single=False):
+        """
+        Update geometry from an xyz block.
+        Assert single ensures that the xyz block is a single-molecule xyz file
+        """
+
+        coord, atoms, _ = parse_xyz(xyzblock, single=True, assert_single=assert_single)
+
+        if atoms == [x.symbol for x in self.atoms]:
+            self.geom.coord = coord
+        else:
+            raise ValueError(
+                "The xyz file signature does not match the current atom list."
+            )
+
+    def to_xyz(self, n=-1, header = True, atoms_last = False): # header is a KSP addition, to make it easier to generate coord.ref files for crest
+        """
+        Return a .xyz block of n-th conformer (if n >= 0), else return default geometry
+        """
+
+        if n == -1:
+            g = self.geom
+        else:
+            g = self.conformers[n]
+
+        N = len(self.atoms)
+        res = ""
+        if(header):
+            res = f"{N}\n{self.name}\n"
+        for i, a in enumerate(self.atoms):
+            x, y, z = g.coord[i]
+            if(atoms_last):
+                res += f"{x:>10.4f} {y:>10.4f} {z:>10.4f}   {a.symbol}\n"
+            else:
+                res += f"{a.symbol} {x:>10.4f} {y:>10.4f} {z:>10.4f}\n"
+        return res
+
+    def get_bond_length(self, b: Bond):
+        i1, i2 = self.atoms.index(b.a1), self.atoms.index(b.a2)
+        return self.geom.get_distance(i1, i2)
+
+    def get_angle(self, a1: Atom, a2: Atom, a3: Atom):
+        "Calculate and return an angle between three atoms. a2 is the middle one"
+        i1 = self.get_atom_idx(a1)
+        i2 = self.get_atom_idx(a2)
+        i3 = self.get_atom_idx(a3)
+        return self.geom.get_angle(i1, i2, i3)
+
+    def yield_bonds(self, *b_types):
+        """
+        Get bonds that match the atom symbols
+        b_type is a string of type "Cs-Br"
+        """
+        for bt in b_types:
+            as1, as2 = bt.split("-")
+            for b in self.bonds:
+                if {as1, as2} == {b.a1.symbol, b.a2.symbol}:
+                    yield b
+
+    def fix_geom(
+        self, s1: str = "C", s2: str = "C", dist: float = 1.5, center: bool = True
+    ):
+        """
+        Rescale geometry so that the average length of bonds with selected labels is equal to dist.
+        Also, translate the geometry to the geometric center if center == True
+        """
+        dists = []
+        for b in self.bonds:
+            if set((s1, s2)) == set((b.a1.symbol, b.a2.symbol)):
+                dists.append(self.get_bond_length(b))
+
+        if len(dists) == 0:
+            # Emergency scenario: just average the bond lengths what we already have
+            for b in self.bonds:
+                dists.append(self.get_bond_length(b))
+
+        factor = dist / np.average(dists)
+        self.geom.scale(factor)
+
+        if center:
+            self.geom.center_geom()
+
+    def to_mol2(self):
+        """
+        Return a .mol2 block
+        """
+        mol2 = f"@<TRIPOS>MOLECULE\n{self.name}\n{len(self.atoms)} {len(self.bonds)} 0 0 0\nSMALL\nGASTEIGER\n\n"
+
+        mol2 += "@<TRIPOS>ATOM"
+        for i, a in enumerate(self.atoms):
+            x, y, z = self.geom.coord[i]
+            mol2 += f"\n{i+1:>6} {a.label:<3} {x:>10.4f} {y:>10.4f} {z:>10.4f} {a.atom_type:<10} 1 {a.label if a.ap else 'UNL1'} 0.0"
+
+        mol2 += "\n@<TRIPOS>BOND"
+        for i, b in enumerate(self.bonds):
+            a1, a2 = self.atoms.index(b.a1), self.atoms.index(b.a2)
+            mol2 += f"\n{i+1:>6} {a1+1:>6} {a2+1:>6} {b.bond_type:>10}"
+
+        mol2 += "\n\n"
+
+        return mol2
+
+    def to_mol2_v2(self):
+        """
+        Return a .mol2 block
+        """
+        mol2 = f"@<TRIPOS>MOLECULE\n{self.name}\n{len(self.atoms)} {len(self.bonds)} 0 0 0\nSMALL\nGASTEIGER\n\n"
+
+        mol2 += "\n@<TRIPOS>ATOM"
+        for i, a in enumerate(self.atoms):
+            x, y, z = self.geom.coord[i]
+            mol2 += f"\n{i+1:>6} {a.label:<3} {x:>10.4f} {y:>10.4f} {z:>10.4f} {a.atom_type:<10} 1 {a.label if a.ap else 'UNL1'} 0.0"
+
+        mol2 += "\n@<TRIPOS>BOND"
+        for i, b in enumerate(self.bonds):
+            a1, a2 = self.atoms.index(b.a1), self.atoms.index(b.a2)
+            mol2 += f"\n{i+1:>6} {a1+1:>6} {a2+1:>6} {b.bond_type:>10}"
+
+        mol2 += "\n\n"
+
+        return mol2
+
+
+    def embed_conformers(self, *confs: CartesianGeometry, mode="a"):
+        """
+        This function embeds alternative geometries (conformers)
+        if mode == 'a': append conformers to existing list
+        if mode == 'w': overwrite the list of conformers
+        """
+        if mode == "a":
+            self.conformers.extend(deepcopy(confs))
+        elif mode == "w":
+            self.conformers = deepcopy(confs)
+        else:
+            raise ValueError("Mode can only be 'w' or 'a'")
+
+    def confs_to_multixyz(self):
+        labels = [x.symbol for x in self.atoms]
+        allxyz = ""
+        for i, conf in enumerate(self.conformers):
+            xyz = conf.to_xyz(labels, f"{self.name}:{i+1}")
+            allxyz += xyz
+        return allxyz
+
+    def confs_to_xyzs(self):
+        labels = [x.symbol for x in self.atoms]
+        allxyz = []
+        for i, conf in enumerate(self.conformers):
+            xyz = conf.to_xyz(labels, f"{self.name}:{i+1}")
+            allxyz.append(xyz)
+        return allxyz
+
+    def confs_to_molecules(self, name_fmt="{name}_cf{n}"):
+        mols = []
+        for cn, cg in enumerate(self.conformers):
+            name = name_fmt.format(name=self.name, n=cn)
+            m = Molecule(name, self.atoms, self.bonds, cg, clone=True)
+            mols.append(m)
+
+        return mols
+
+    def confs_to_mol2_files(self, path="", name_fmt="{name}_cf{n}"):
+        """
+        This function exports all conformers from current molecule file into mol2 files.
+
+        `path`: directory into which they should be exported.
+            Will be created if not existent!
+
+        `name_fmt`: name formatter. Accepts the following variables:
+            - `{name}`: molecule name
+            - `{n}`: conformer number (conformers will be numcered starting with 0)
+
+        """
+        # check if the folder exists and create if needed
+        if not os.path.isdir(path):
+            os.makedirs(path)
+
+        if self.conformers:
+            for m in self.confs_to_molecules(name_fmt=name_fmt):
+
+                fn = os.path.normpath(os.path.join(path, f"{m.name}.mol2"))
+
+                with open(fn, "wt") as f:
+                    f.write(m.to_mol2())
+        else:
+            print(f"{self.name}: no conformers to export")
+
+    def remove_atoms(self, *atoms: Atom):
+        """
+        Remove selected atoms from the molecule.
+        Also deletes all bonds to and between selected atoms, and the respective coordinates.
+        """
+        for a in atoms:
+            for b in self.get_bonds_with_atom(a):
+                self.bonds.remove(b)
+
+            aidx = self.get_atom_idx(a)
+            self.geom.delete(aidx)
+            for conf in self.conformers:
+                conf.delete(aidx)
+
+            self.atoms.remove(a)
+
+
+    #KSP-modified 2023-08-16
+    #adding ability to inject name during joining
+    #adding ability to only keep one of the two names (useful for adding two of the same fragments
+    @classmethod
+    def join(
+        cls,
+        m1: Molecule,
+        m2: Molecule,
+        a11: Atom,
+        a12: Atom,
+        a21: Atom,
+        a22: Atom,
+        dist: float = 10.0,
+        addname: str = "",
+        rotations = [2,5], # /
+        central_atom = "I47", #/
+        scan = "Normal" #/
+    ):
+        """
+        Join two molecular fragments with bond a11--a21, delete atoms a12 and a22
+        """
+        
+
+
+        if m1.has_confomers() or m2.has_confomers():
+            # TODO: implement conformer joining, because that could be pretty powerful
+            raise NotImplementedError("Currently conformer joining is not supported")
+
+        ## Pre-flight checks
+        if not len(_bm1 := m1.get_bonds_with_atom(a12)) == 1:
+            raise SyntaxError(
+                f"Attachment point should only have one bond, found {len(_bm1)}"
+            )
+        if not len(_bm2 := m2.get_bonds_with_atom(a22)) == 1:
+            raise SyntaxError(
+                f"Attachment point should only have one bond, found {len(_bm1)}"
+            )
+
+        ## STEP 1. Determine the rotation matrix.
+        #   In this algorithm, we rotate `m2`
+
+        i11 = m1.atoms.index(a11) ## this is the index of the atom of the base fragment
+        i12 = m1.atoms.index(a12)
+        i21 = m2.atoms.index(a21)
+        i22 = m2.atoms.index(a22)
+        #print("... in molecule.join(), attachment points are:", a12, a22, " with the indexes: ", i12, i22)
+        #print("... in molecule.join(), bonded atoms are:", a11, a21, " with the indexes:", i11, i21)
+        ##x=input()
+        v1 = m1.geom.coord[i12] - m1.geom.coord[i11]
+        v2 = m2.geom.coord[i22] - m2.geom.coord[i21]
+
+        R = rotation_matrix(v2, -v1)
+
+        ## STEP 2. Transform and translate a copy of geom-2
+        g1 = deepcopy(m1.geom)
+        g2 = deepcopy(m2.geom)
+
+        g1.set_origin(i11)
+        g2.set_origin(i21)
+
+        g2.transform(R)
+
+        # vT = (v1 * (dist - np.linalg.norm(v1) - np.linalg.norm(v2)) /
+        #   np.linalg.norm(v1))
+
+        vT = v1 * dist / np.linalg.norm(v1)
+        g2.translate(vT)
+        
+
+
+        #try: ####### currently held together with duct tape... if it is necessary, fucking fix this later.
+        if(scan is not None):
+            scanlist = {}
+
+            ### GAME PLAN:
+            ### get the three atoms from the fragment - recursive_atoms(m1, 1) ... join2[0].recursive_atoms(["H48"], n=3)
+    
+            # a1list, b1list = m1.recursive_atoms(a11, 2)
+            a1list, b1list = m1.recursive_atoms(a11, rotations[0])# 2)
+            # a2list, b2list = m2.recursive_atoms(a21, 5)# 5)
+            a2list, b2list = m2.recursive_atoms(a21, rotations[1])# 5)
+
+
+            a1_geoms = []
+            a2_geoms = []
+            for atoms in a1list:
+                a1_geoms.append(g1.coord[m1.get_atom_idx(atoms)].tolist())
+            for atoms in a2list:
+                a2_geoms.append(g2.coord[m2.get_atom_idx(atoms)].tolist())
+
+            #send g1/g2, duhhh
+            #normal1 = fit_plane(m1.get_subgeom(a1list).coord)
+            #normal2 = fit_plane(m2.get_subgeom(a2list).coord)
+            normal1 = fit_plane(a1_geoms)
+            normal2 = fit_plane(a2_geoms)
+            angle = angle_between_normals(normal1, normal2)
+            if(scan == "Normal"):
+                ### Need to make sure that the angle of deviation between the normals are calculated consistently, so that rotations are applied in the same direction..
+                scan = [ deg_rad_conv(angle), -1*deg_rad_conv(180-angle), deg_rad_conv(-1*angle), deg_rad_conv(float(180-angle))]
+            
+            else:
+                try:
+                    scan = [deg_rad_conv(float(x)) for x in scan]
+                except:
+                    scan = [ deg_rad_conv(angle), -1*deg_rad_conv(180-angle), deg_rad_conv(-1*angle), deg_rad_conv(float(180-angle))]
+
+            ########################################### this part... consider the pos/neg coordinates....
+            """
+            if(normal2[0] > 0):
+                scan = [ deg_rad_conv(angle), -1*deg_rad_conv(180-angle)]
+            else:
+                scan = [deg_rad_conv(-1*angle), deg_rad_conv(float(180-angle))]
+            """
+            
+            # The sign of the difference between the normals is a pain to keep track of. Just compute all four possible rotations (note: only two will be in plane)
+            # check the correct ones by confirming normals again
+            
+    
+    
+            
+            
+            max_coords = []
+            ##x=input("\n\n\n\n\n\n\n\n")
+            testcat = np.concatenate((g1.coord, g2.coord))
+            df_after = pd.DataFrame(testcat)
+            df_after.insert(0,'atoms', m1.atoms+m2.atoms)
+            df_after.columns.name = None
+            print(scan)
+            # x=input("scan!!")
+            ################################################################################### the following tracks rotations....
+            #df_after.to_csv(f"__df_BEFORE_rotation_{m2.name}_.xyz", index=None)  
+            for i,rotation in enumerate(scan):
+                print(i, rotation)
+                # x=input("inside")
+                _tmpcoord = sub_rotate_around_line(g2.coord, g2.coord[0],g2.coord[1], float(scan[i]))
+                #m1_center = np.mean(m1.geom.coord, axis=0)
+                m2_center = np.mean(_tmpcoord, axis=0)
+                
+                
+                """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""duct tape here""" ## add regex to find I ##
+                #just need the coordinates of the atom. Submit the atom, find the coords after
+                
+                #$%
+
+                if(central_atom == "centroid"):
+                    _coordlist = []
+                    m1_center = find_centroid(m1.geom.coord)
+
+                #exit()
+                print("central_atom", central_atom)
+                print(m1.geom.coord)
+                # print(m1.get_atom_idx(central_atom))
+                try:
+                    #$% m1_center = m1.geom.coord[m1.get_atom_idx("I47")]
+                    #5-7-2025
+                    m1_center = m1.geom.coord[central_atom]
+                    # 5-7-2025 #m1_center = m1.geom.coord[m1.get_atom_idx(central_atom)]
+                    print("m1 center!!!", m1_center)
+                except:
+                    #$% m1_center = m1.geom.coord[m1.get_atom_idx("I")]
+                    #5-7-2025
+                    m1_center = m1.geom.coord[m1.get_atom_idx("I")]
+                    print(m1_center," 2")
+                #m1_center = np.mean(g1.coord)
+                # x=input("uhm")
+                df_rotating = pd.DataFrame(_tmpcoord)
+                df_rotating.insert(0,'atoms', m2.atoms)
+        
+                df_rotating.columns.name = None
+                
+                geoms2 =[]
+                for atoms in a2list: #could I create a mask here?
+                    geoms2.append(_tmpcoord[m2.get_atom_idx(atoms)].tolist())
+                    #print(geoms2)
+                    
+                #print("normal1", normal1)
+                #print("fit_plane", fit_plane(geoms2))
+                angle_check = angle_between_normals(normal1, fit_plane(geoms2))
+                #print("angle_check", angle_check)
+    
+                if((angle_check<3 and angle_check>-3) or (angle_check<183 or angle_check>177)):
+                    scanlist[i] = distance(m1_center,m2_center)
+                else:
+                    scanlist[i] = 0
+                #if(scanlist[-1]=max(scanlist)
+                #df_rotating.to_csv(f"__df_after_{m2.name}_rotated_by_{float(rotation)}.xyz", index=None)  
+                
+                ##output each rotation...
+    
+                testcat = np.concatenate((g1.coord, _tmpcoord))
+                df_after = pd.DataFrame(testcat)
+                df_after.insert(0,'atoms', m1.atoms+m2.atoms)
+                df_after.columns.name = None
+                ################################################################################### the following tracks rotations....
+                #df_after.to_csv(f"__df_after_rotation_{rotation}_scan-dist_{scanlist[i]}_{m2.name}_rotated_by_{float(max(scanlist, key=scanlist.get))}.xyz", index=None)  
+                ##output each rotation...
+                
+
+            # print(scanlist)
+            # x=input("scanlist")
+            g2.coord = sub_rotate_around_line(g2.coord, g2.coord[0],g2.coord[1], scan[max(scanlist, key=scanlist.get)])
+
+        ####
+        else:
+            x=input("no scanning")
+        #except:
+        #    pass
+
+        g1.delete(i12)
+        g2.delete(i22)
+        
+        ########################################### check for alignment... as with the above portion... lets add this to a different function afterwards... ###########################################
+        
+        """
+        m1_coord = deepcopy(m1.geom)
+        m1_coord.delete(i12)
+        print(Rotation.align_vectors(m1_coord.coord, g1.coord))
+        print(m1_coord.coord, g1.coord)
+        print(len(m1_coord.coord), len(g1.coord))
+        #x=input("\t\t\t\t\n\n\nCHECKING ROTATION ABOVE")
+        """
+        ############################################################################################################################################################################
+
+        #added if-else statement, only else statement contents were present
+        if(len(addname)>0):
+            name = f"{m1.name}_{m2.name}_{addname}"
+        if(str(addname) == "--one-name"): 
+            name = f"{m1.name}"
+        if(addname==""):
+            name = f"{m1.name}_{m2.name}"
+        atoms = []
+        bonds = []
+
+        m1_atoms, m1_bonds, m1_map = structure_clone(m1.atoms, m1.bonds)
+        m2_atoms, m2_bonds, m2_map = structure_clone(m2.atoms, m2.bonds)
+        ## the above two lines collect the fragments before joining...
+        ### find a quick way to gather first atoms of the fragments...
+        #i11 = m1.atoms.index(a11) #this line collects the index..., which will now be the index of m1_atoms (since that is the first one...)
+        
+
+        
+        ## 2023-11-29
+        m1_len = len(m1_atoms)
+        m2_len = len(m2_atoms)
+        connected_m1_idx = i11 ## index of connected atom of base fragment
+        connected_m2_idx1 = m1_len+1 #assumes first connected atom is first in line
+        connected_m2_idx2 = m1_len+2 ## see assumption above...
+        connected_m2_idx3 = m1_len+3 ## see  assumption...
+        important_atom_list = [connected_m1_idx, connected_m2_idx1, connected_m2_idx2, connected_m2_idx2]
+
+        
+
+        for a in m1_atoms + m2_atoms:
+            if not a in (m1_map[a12], m2_map[a22]):
+                atoms.append(a)
+
+        for b in m1_bonds + m2_bonds:
+            if (m2_map[a22] not in b) and (m1_map[a12] not in b):
+                bonds.append(b)
+
+        geom = np.concatenate((g1.coord, g2.coord), axis=0)
+
+        result = cls(name=name, atoms=atoms, bonds=bonds, geom=CartesianGeometry(geom))
+
+        result.fragment_atoms = m1.fragment_atoms
+        
+
+        result.add_bond(m1_map[a11], m2_map[a21])
+
+        result.important_atoms = important_atom_list
+
+        
+        """
+        if(len(m1.fragment_atoms) > 1):
+
+            result.fragment_atoms.append(m2_atoms) ## this will add the final fragment if m1.fragment_atoms comes preloaded #here first
+            for atom in m2_atoms:
+                atom.frag_label = "f3"
+
+        if(m1.fragment_atoms == [] or len(m1.fragment_atoms)>3): #m1.fragment_atoms is not preloaded (meaning, it is the first time the object is generated)4
+            _tmp = [m1_atoms, m2_atoms]
+
+
+            result.fragment_atoms.append(m1_atoms)
+            result.fragment_atoms.append(m2_atoms)
+            for atom in m1_atoms:
+                atom.frag_label = "f1"
+                #print(atom.frag_label)
+            for atom in m2_atoms:
+                atom.frag_label = "f2"
+                #print(atom.frag_label)
+            ##x=input("first pass")
+            _tmp = []
+            #result.fragment_atoms.append(m2_atoms)
+        """
+        #print("\n\n\n\n CHECKING - ADDING BONDS HERE\n\n\n\n")
+        #print(result.fragment_atoms)
+        ##x=input("see above..")
+        #print("adding bonds", m1_bonds, m2_bonds)
+        ##x=input("see?")
+        del m1
+        # result.relabel_atoms()
+        #print(result.geom.coord)
+        #print("exiting")
+        return result
+
+    """
+    @classmethod
+    def join(
+        cls,
+        m1: Molecule,
+        m2: Molecule,
+        a11: Atom,
+        a12: Atom,
+        a21: Atom,
+        a22: Atom,
+        dist: float = 10.0,
+        addname: str = "",
+    ):
+        
+        #Join two molecular fragments with bond a11--a21, delete atoms a12 and a22
+        
+
+        if m1.has_confomers() or m2.has_confomers():
+            # TODO: implement conformer joining, because that could be pretty powerful
+            raise NotImplementedError("Currently conformer joining is not supported")
+
+        ## Pre-flight checks
+        if not len(_bm1 := m1.get_bonds_with_atom(a12)) == 1:
+            raise SyntaxError(
+                f"Attachment poing should only have one bond, found {len(_bm1)}"
+            )
+        if not len(_bm2 := m2.get_bonds_with_atom(a22)) == 1:
+            raise SyntaxError(
+                f"Attachment poing should only have one bond, found {len(_bm1)}"
+            )
+
+        ## STEP 1. Determine the rotation matrix.
+        #   In this algorithm, we rotate `m2`
+
+        i11 = m1.atoms.index(a11)
+        i12 = m1.atoms.index(a12)
+        i21 = m2.atoms.index(a21)
+        i22 = m2.atoms.index(a22)
+
+        v1 = m1.geom.coord[i12] - m1.geom.coord[i11]
+        v2 = m2.geom.coord[i22] - m2.geom.coord[i21]
+
+        R = rotation_matrix(v2, -v1)
+        
+
+        ## STEP 2. Transform and translate a copy of geom-2
+        g1 = deepcopy(m1.geom)
+        g2 = deepcopy(m2.geom)
+
+        #g2.coord = sub_rotate_around_line(m2.geom.coord, m2.geom.coord[i22],m2.geom.coord[i21], 3.14)        
+        g1.set_origin(i11)
+        g2.set_origin(i21)
+
+        g2.transform(R)
+
+        # vT = (v1 * (dist - np.linalg.norm(v1) - np.linalg.norm(v2)) /
+        #   np.linalg.norm(v1))
+
+        vT = v1 * dist / np.linalg.norm(v1)
+        g2.translate(vT)
+
+        ## STEP 3. Start assembling the new class
+        g1.delete(i12)
+        g2.delete(i22)
+
+        #added if-else statement, only else statement contents were present
+        if(len(addname)>0):
+            name = f"{m1.name}_{m2.name}_{addname}"
+        if(str(addname) == "--one-name"): # stupid mistake. This was an "elif" before.
+                                          # the if statement (above) should be satisfied
+                                          # when this section needs to be accessed
+                                          # since it was "elif" it would always be skipped
+                                          # duh...
+            name = f"{m1.name}"
+        if(addname==""):
+            name = f"{m1.name}_{m2.name}"
+        atoms = []
+        bonds = []
+
+        m1_atoms, m1_bonds, m1_map = structure_clone(m1.atoms, m1.bonds)
+        m2_atoms, m2_bonds, m2_map = structure_clone(m2.atoms, m2.bonds)
+
+
+        #### KSP MODIFICATION
+        #### LETS APPLY A SECOND ROTATION TO M2 THAT MINIMIZES STRUCTURES - At this point the structures were cloned and transformed
+        
+        m1_cent = m1.geom.get_centroid()
+        m2_cent = m2.geom.get_centroid()
+
+        #g2.coord = sub_rotate_around_line(m2.geom.coord, m2.geom.coord[i22],m2.geom.coord[i21], 3.14)
+        with open("m2_coord_before_Rotation.xyz", "w+") as f:
+            f.write(m2.to_xyz())        
+        
+        #m2.geom.coord = sub_rotate_around_line(m2.geom.coord, m2.geom.coord[i22],m2.geom.coord[i21], 3.1456)
+        with open("m2_coord_After_Rotation.xyz", "w+") as f:
+            f.write(m2.to_xyz())        
+        
+        #x=input("HERE")
+        
+        
+
+        
+        
+        
+        for a in m1_atoms + m2_atoms:
+            if not a in (m1_map[a12], m2_map[a22]):
+                atoms.append(a)
+
+        for b in m1_bonds + m2_bonds:
+            if (m2_map[a22] not in b) and (m1_map[a12] not in b):
+                bonds.append(b)
+
+        geom = np.concatenate((g1.coord, g2.coord), axis=0)
+
+        result = cls(name=name, atoms=atoms, bonds=bonds, geom=CartesianGeometry(geom)) 
+        result_bonds = deepcopy(result.bonds)
+        result.add_bond(m1_map[a11], m2_map[a21])
+        
+        ### TEST ROTATIONS
+        
+        testing123 = cls(name="TESTING_ROTATION", atoms=atoms, bonds=bonds, geom=CartesianGeometry(geom))
+        testing_bonds = deepcopy(testing123.bonds)
+        testing123.add_bond(m1_map[a11], m2_map[a21])
+        print("writing the test structure")
+        with open("testing_rotation.xyz", "w+") as f:
+            f.write(testing123.to_xyz())
+        
+        
+        # result.relabel_atoms()
+        #for every bond that we create, we should add it to a list
+
+        return result
+        """
+
+    @classmethod
+    def join_ap(
+        cls,
+        m1: Molecule,
+        m2: Molecule,
+        ap1: str = "A0",
+        ap2: str = "A1",
+        dist: float = 10.0,
+        addname: str = "",
+        rotations = [2,5],
+        central_atom = "I47",
+        scan = "Normal"
+        #$%save_bond: bool = False
+        
+    ):
+        """
+        Join two molecules at the attachment points. Attachment points are defined as atoms with distinct labels, such as A0.
+        """
+
+        a12 = m1.get_atom(ap1)
+        a22 = m2.get_atom(ap2)
+
+        bonds1 = m1.get_bonds_with_atom(a12)
+        bonds2 = m2.get_bonds_with_atom(a22)
+        
+                        
+        #if save_bond:
+            
+
+        assert (
+            len(bonds1) == 1
+        ), f"Doesn't look like ap1 is an attachment point: {len(bonds1)} bonds"
+        assert (
+            len(bonds2) == 1
+        ), f"Doesn't look like ap2 is an attachment point: {len(bonds2)} bonds"
+
+        b1 = bonds1[0]
+        b2 = bonds2[0]
+
+        a11 = b1.a1 if b1.a2 == a12 else b1.a2
+        a21 = b2.a1 if b2.a2 == a22 else b2.a2
+
+        #print("... in join_ap: THE ATTACHMENT POINTS ARE", a12, a22)
+        #print("... in join_ap: THEY ARE ATTACHED TO:", bonds1, bonds2)
+        return cls.join(m1, m2, a11, a12, a21, a22, dist=dist, addname=addname, rotations=rotations, central_atom = central_atom, scan = scan)
+
+    @classmethod
+    def _get_join_ap_fx(cls, ap1, ap2, dist):
+        def fx(mol_tuple):
+            return cls.join_ap(mol_tuple[0], mol_tuple[1], ap1=ap1, ap2=ap2, dist=dist)
+
+        return fx
+
+    def bounding_box(self):
+        """
+        Get the rectangular space that encompasses all atoms in all conformers
+        """
+        mins = []
+        maxs = []
+
+        for g in self.conformers:
+            rmin, rmax = g.bounding_box()
+            mins.append(rmin)
+            maxs.append(rmax)
+
+        rmin = np.min(mins, axis=(0,))
+        rmax = np.max(maxs, axis=(0,))
+
+        return rmin, rmax
+
+    def to_xml(self, pretty=True):
+        """
+        Save the molecule object in an xml format
+        """
+
+        xdoc = xmd.Document()
+
+        xdoc.appendChild(xdoc.createComment("MOLLI PACKAGE EXPERIMENTAL XML FORMAT"))
+
+        xmol = xdoc.createElement("molecule")
+        xmol.setAttribute("name", self.name)
+        xdoc.appendChild(xmol)
+        xatoms = xdoc.createElement("atoms")
+        xbonds = xdoc.createElement("bonds")
+        xgeom = xdoc.createElement("geometry")
+        xconfs = xdoc.createElement("conformers")
+        xprops = xdoc.createElement("properties")
+
+        for x in xatoms, xbonds, xgeom, xconfs, xprops:
+            xmol.appendChild(x)
+
+        ids = {}
+        for i, a in enumerate(self.atoms):
+            xa = xdoc.createElement("a")
+            xa.setAttribute("id", f"{i+1}")
+            xa.setAttribute("s", a.symbol)
+            xa.setAttribute("t", a.atom_type)
+            xa.setAttribute("l", a.label)
+            ids[a] = f"{i+1}"
+            xatoms.appendChild(xa)
+
+        for i, b in enumerate(self.bonds):
+            xb = xdoc.createElement("b")
+            xb.setAttribute("id", f"{i+1}")
+
+            id1, id2 = ids[b.a1], ids[b.a2]
+            xb.setAttribute("c", f"{id1} {id2}")
+            xb.setAttribute("t", b.bond_type)
+
+            xbonds.appendChild(xb)
+
+        xg0 = xdoc.createElement("g")
+        xg0.setAttribute("u", "A")
+        xg0.setAttribute("t", "cart/3d")
+        xg0.appendChild(xdoc.createTextNode(self.geom.dumps()))
+        xgeom.appendChild(xg0)
+
+        for i, conf in enumerate(self.conformers):
+            cg = xdoc.createElement("g")
+            cg.setAttribute("id", f"{i+1}")
+            cg.setAttribute("u", "A")
+            cg.setAttribute("t", "cart/3d")
+            cg.appendChild(xdoc.createTextNode(conf.dumps()))
+            xconfs.appendChild(cg)
+
+        if pretty:
+            return xdoc.toprettyxml()
+        else:
+            return xdoc.toxml()
+
+    @classmethod
+    def from_xml(cls, fp: str) -> Molecule:
+        """
+        Parse a molli xml file and create a Molecule instance
+        """
+        et = xparse(fp)
+        # rt = et.getroot()
+
+        mol = et.getroot()
+        name = mol.attrib["name"]
+
+        xatoms = mol.findall("./atoms/a")
+        xbonds = mol.findall("./bonds/b")
+        xgeom = mol.find("./geometry/g")
+        xconfs = mol.findall("./conformers/g")
+        # xprops = mol.findall("./properties/p")  # not really implemented yet
+
+        atoms = []
+        ids = []
+        bonds = []
+        conformers = []
+
+        for a in xatoms:
+            aid, s, l, at = a.attrib["id"], a.attrib["s"], a.attrib["l"], a.attrib["t"]
+            ids.append(aid)
+            atoms.append(Atom(s, l, at))
+
+        for b in xbonds:
+            ia1, ia2 = map(ids.index, b.attrib["c"].split())
+            bt = b.attrib["t"]
+            bonds.append(Bond(atoms[ia1], atoms[ia2], bt))
+
+        geom = CartesianGeometry.from_str(xgeom.text)
+        conformers = [CartesianGeometry.from_str(g.text) for g in xconfs]
+
+        return cls(name, atoms=atoms, bonds=bonds, geom=geom, conformers=conformers)
+
+    @classmethod
+    def from_file(cls, fref: str | IOBase):
+
+        # Determine file extension
+        if isinstance(fref, str):
+            ext = fref.rsplit(".", 1)[1]
+        elif hasattr(fref, "name"):
+            ext = fref.name.rsplit(".", 1)[1]
+
+        if ext not in ["mol2", "xml"]:
+            raise ValueError("Unknown file extension")
+
+        if ext == "mol2":
+            return cls.from_mol2(fref)
+        if ext == "xml":
+            return cls.from_xml(fref)
