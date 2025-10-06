@@ -1,0 +1,28 @@
+Metadata-Version: 2.4
+Name: nbotools
+Version: 0.1.0
+Summary: An NBO output parser
+Author: Karnjit Parmar
+Author-email: Karnjit Parmar <ksparmar@illinois.edu>
+Requires-Python: >=3.6
+Description-Content-Type: text/markdown
+Requires-Dist: numpy
+Requires-Dist: pandas
+Dynamic: author
+Dynamic: requires-python
+
+KSParmar - 2025
+
+
+Extracts information from NBO output files.
+Not currently complete
+
+Currently implemented:
+- Orca output files: nbbp, npa, E2pert
+
+todo (softwares):
+- Gaussian
+
+todo (NBO data):
+- Sterics, bond orders, NRT, etc ..
+

@@ -1,0 +1,8 @@
+README.md
+pyproject.toml
+setup.py
+nbotools.egg-info/PKG-INFO
+nbotools.egg-info/SOURCES.txt
+nbotools.egg-info/dependency_links.txt
+nbotools.egg-info/requires.txt
+nbotools.egg-info/top_level.txt

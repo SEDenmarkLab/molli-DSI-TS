@@ -1,0 +1,10 @@
+README.md
+pyproject.toml
+setup.py
+substructure/__init__.py
+substructure/substructure.py
+substructure.egg-info/PKG-INFO
+substructure.egg-info/SOURCES.txt
+substructure.egg-info/dependency_links.txt
+substructure.egg-info/requires.txt
+substructure.egg-info/top_level.txt

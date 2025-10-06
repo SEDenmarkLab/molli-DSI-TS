@@ -1,0 +1,12 @@
+[project]
+name = "nbotools"
+version = "0.1.0"
+description = "An NBO output parser"
+authors = [{ name="Karnjit Parmar", email="ksparmar@illinois.edu"}]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["numpy", "pandas"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"

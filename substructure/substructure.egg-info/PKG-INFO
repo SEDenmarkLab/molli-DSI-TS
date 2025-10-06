@@ -1,0 +1,17 @@
+Metadata-Version: 2.4
+Name: substructure
+Version: 0.1.0
+Summary: additional tools to modify substructures
+Author: Karnjit Parmar
+Author-email: Karnjit Parmar <ksparmar@illinois.edu>
+Requires-Python: >=3.7
+Description-Content-Type: text/markdown
+Requires-Dist: numpy
+Requires-Dist: pandas
+Requires-Dist: rdkit
+Dynamic: author
+Dynamic: requires-python
+
+KSParmar - 2025
+
+tools to work with substructures (interface with molli, modified versions of molli, and rdkit)
