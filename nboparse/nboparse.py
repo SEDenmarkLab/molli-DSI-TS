@@ -508,7 +508,7 @@ class NBOExtract():
                 nbbp_squeezed.append(line)
             
             if int(line.split()[0][:-1])>maxval:
-                maxval = int(line.split()[0][:-1]) # FUCKING FUCK ARE YOU FUCKING KIDDING ME FUCK
+                maxval = int(line.split()[0][:-1]) # 
                 _tmp = [line.split()[0], ' '.join(line.split()[1:-8])]  #need to collect bond information
                                                                         #piggyback off the "maxval" computation, where we only iterate through the first nbbp block (need to stop after first block
                                                                         # or atleast before the last block, especially if it has <8 items)
